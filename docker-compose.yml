@@ -1,0 +1,218 @@
+version: '3.8'
+
+services:
+  # --- 1. MySQL ---
+  mysql-server:
+    image: mysql:8.0
+    container_name: mysql-server
+    networks:
+      - infra_net
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_USER: zabbix
+      MYSQL_DATABASE: zabbixdb
+      MYSQL_PASSWORD: PasswOrd
+      MYSQL_ROOT_PASSWORD: StrongPassword
+    volumes:
+      - ./zabbix-data/mysql:/var/lib/mysql
+    restart: unless-stopped
+
+  # --- 2. Zabbix Server ---
+  zabbix-server-mysql:
+    image: zabbix/zabbix-server-mysql:alpine-7.4-latest
+    container_name: zabbix-server-mysql
+    networks:
+      - infra_net
+    ports:
+      - "10051:10051"
+    volumes:
+      - ./zabbix-data/alertscripts:/usr/lib/zabbix/alertscripts
+      - ./zabbix-data/externalscripts:/usr/lib/zabbix/externalscripts
+      - ./zabbix-data/export:/var/lib/zabbix/export
+      - ./zabbix-data/modules:/var/lib/zabbix/modules
+      - ./zabbix-data/enc:/var/lib/zabbix/enc
+      - ./zabbix-data/ssh_keys:/var/lib/zabbix/ssh_keys
+      - ./zabbix-data/mibs:/var/lib/zabbix/mibs
+      - ./zabbix-data/snmptraps:/var/lib/zabbix/snmptraps
+    environment:
+      - DB_SERVER_HOST=mysql-server
+      - MYSQL_DATABASE=zabbixdb
+      - MYSQL_USER=zabbix
+      - MYSQL_PASSWORD=PasswOrd
+      - MYSQL_ROOT_PASSWORD=StrongPassword
+      - ZBX_SERVERNAME=Zabbix Server
+      - ZBX_JAVAGATEWAY=zabbix-java-gateway
+    depends_on:
+      - mysql-server
+      - zabbix-java-gateway
+    restart: unless-stopped
+
+  # --- 3. Zabbix Web ---
+  zabbix-web-nginx-mysql:
+    image: zabbix/zabbix-web-nginx-mysql:alpine-7.4-latest
+    container_name: zabbix-web-nginx-mysql
+    networks:
+      - infra_net
+    ports:
+      - "80:8080"
+      - "443:8443"
+    volumes:
+      - ./zabbix-nginx/nginx:/etc/ssl/nginx
+      - ./zabbix-nginx/modules/:/usr/share/zabbix/modules/
+    environment:
+      - ZBX_SERVER_HOST=zabbix-server-mysql
+      - DB_SERVER_HOST=mysql-server
+      - MYSQL_DATABASE=zabbixdb
+      - MYSQL_USER=zabbix
+      - MYSQL_PASSWORD=PasswOrd
+      - MYSQL_ROOT_PASSWORD=StrongPassword
+      - PHP_TIMEZONE=Etc/UTC
+    depends_on:
+      - mysql-server
+      - zabbix-server-mysql
+    restart: unless-stopped
+
+  # --- 4. Zabbix Java Gateway ---
+  zabbix-java-gateway:
+    image: zabbix/zabbix-java-gateway:alpine-7.4-latest
+    container_name: zabbix-java-gateway
+    networks:
+      - infra_net
+    ports:
+      - "10052:10052"
+    restart: unless-stopped
+
+  # --- 5. Zabbix Agent2 ---
+  zabbix-agent:
+    image: zabbix/zabbix-agent2:alpine-7.4-latest
+    container_name: zabbix-agent
+    networks:
+      - infra_net
+    volumes:
+      - /:/host:ro
+      - /var/log:/var/log:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    environment:
+      - ZBX_SERVER_HOST=zabbix-server-mysql
+      - ZBX_HOSTNAME=Linux-Server-Monitor
+    privileged: true
+    depends_on:
+      - zabbix-server-mysql
+    restart: unless-stopped
+
+  # --- 6. Prometheus ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    networks:
+      - infra_net
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus-data:/prometheus  # Постоянное хранение метрик
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    depends_on:
+      - node_exporter
+      - elasticsearch
+    restart: unless-stopped
+
+  # --- 7. Grafana ---
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks:
+      - infra_net
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - elasticsearch
+    restart: unless-stopped
+
+  # --- 8. Elasticsearch ---
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    networks:
+      - infra_net
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    restart: unless-stopped
+
+  # --- 9. Logstash ---
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: logstash
+    networks:
+      - infra_net
+    volumes:
+      - ./logstash/pipeline/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  # --- 10. Node Exporter ---
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    networks:
+      - infra_net
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+
+  # --- 11. Kibana ---
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    networks:
+      - infra_net
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_NAME=kibana
+      - SERVER_HOST=0.0.0.0
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+networks:
+  infra_net:
+    driver: bridge
+
+volumes:
+  grafana-data:
+  elasticsearch-data:
+  prometheus-data:  # Добавлен volume для хранения данных Prometheus
