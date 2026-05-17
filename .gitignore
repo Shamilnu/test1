@@ -1,1 +1,3 @@
 zabbix-data/mysql/*
+/newold/
+/old/
